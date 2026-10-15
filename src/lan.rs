@@ -351,10 +351,10 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
     Ok(())
 }
 
-const NAME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+const NAME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Turn a computer name typed in the ID box ("PC-LAB1" or "pc-lab1.local")
-/// into a direct-IP address on the LAN ("pc-lab1.local:21118"), so the peer
+/// into a direct-IP address on the LAN ("192.168.1.20:21118"), so the peer
 /// is reached without knowing its IP. The peer needs "Enable direct IP access".
 /// Returns None for anything that is not such a name, so it is used as an ID.
 pub fn resolve_computer_name(id: &str) -> Option<String> {
@@ -363,11 +363,15 @@ pub fn resolve_computer_name(id: &str) -> Option<String> {
         return None; // a custom ID connected to before
     }
     let port = config::RELAY_PORT + 1;
-    let host = format!("{name}.local");
-    if name_resolves(&host, port as u16) {
-        return Some(format!("{host}:{port}"));
+    // "<name>.local" goes through mDNS; the bare name through the system
+    // resolver, which on Windows also asks the LAN (LLMNR / NetBIOS) and
+    // works where mDNS is blocked.
+    let hosts = [format!("{name}.local"), name.to_owned()];
+    if let Some(ip) = lookup_ipv4(&hosts, port as u16) {
+        log::info!("computer name {name} resolved to {ip}");
+        return Some(format!("{ip}:{port}"));
     }
-    // No mDNS: fall back to the address found by LAN discovery, if unambiguous
+    // Not resolvable: fall back to the address found by LAN discovery, if unambiguous
     let mut ips: Vec<String> = config::LanPeers::load()
         .peers
         .into_iter()
@@ -402,20 +406,38 @@ fn computer_name(id: &str) -> Option<&str> {
     valid.then_some(name)
 }
 
-fn name_resolves(host: &str, port: u16) -> bool {
-    // The system resolver has no timeout of its own; a missing .local name
-    // can take seconds, so give up early and treat the input as an ID.
+/// The first IPv4 address any of `hosts` resolves to. The lookups run in
+/// parallel because the system resolver has no timeout of its own and a
+/// missing name can take seconds; whatever has not answered in time is
+/// treated as not found.
+fn lookup_ipv4(hosts: &[String], port: u16) -> Option<Ipv4Addr> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let target = (host.to_owned(), port);
-    std::thread::spawn(move || {
-        let found = target
-            .to_socket_addrs()
-            .map(|mut addrs| addrs.next().is_some())
-            .unwrap_or(false);
-        // The receiver is gone after a timeout; nothing left to report to
-        tx.send(found).ok();
-    });
-    rx.recv_timeout(NAME_LOOKUP_TIMEOUT).unwrap_or(false)
+    for host in hosts {
+        let tx = tx.clone();
+        let target = (host.clone(), port);
+        std::thread::spawn(move || {
+            let found = target.to_socket_addrs().ok().and_then(|addrs| {
+                addrs
+                    .filter_map(|a| match a.ip() {
+                        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4),
+                        _ => None,
+                    })
+                    .next()
+            });
+            // The receiver is gone after a timeout; nothing left to report to
+            tx.send(found).ok();
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + NAME_LOOKUP_TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Some(ip)) => return Some(ip),
+            Ok(None) => continue, // this host failed; wait for the others
+            Err(_) => return None, // all failed, or timed out
+        }
+    }
 }
 
 #[cfg(test)]
