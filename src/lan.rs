@@ -353,21 +353,20 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
 
 const NAME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Turn a computer name typed in the ID box ("PC-LAB1" or "pc-lab1.local")
-/// into a direct-IP address on the LAN ("192.168.1.20:21118"), so the peer
+/// Turn a computer name typed in the ID box ("PC-LAB1", "pc-lab1.local",
+/// optionally with ":port") into a direct-IP address on the LAN ("192.168.1.20:21118"), so the peer
 /// is reached without knowing its IP. The peer needs "Enable direct IP access".
 /// Returns None for anything that is not such a name, so it is used as an ID.
 pub fn resolve_computer_name(id: &str) -> Option<String> {
-    let name = computer_name(id)?;
-    if config::PeerConfig::exists(id) {
-        return None; // a custom ID connected to before
-    }
-    let port = config::RELAY_PORT + 1;
+    // A custom ID that looks like a name is only delayed by the lookup:
+    // when no LAN computer answers to it, it is used as an ID as before.
+    let (name, port) = computer_name(id)?;
+    let port = port.unwrap_or((config::RELAY_PORT + 1) as u16);
     // "<name>.local" goes through mDNS; the bare name through the system
     // resolver, which on Windows also asks the LAN (LLMNR / NetBIOS) and
     // works where mDNS is blocked.
     let hosts = [format!("{name}.local"), name.to_owned()];
-    if let Some(ip) = lookup_ipv4(&hosts, port as u16) {
+    if let Some(ip) = lookup_ipv4(&hosts, port) {
         log::info!("computer name {name} resolved to {ip}");
         return Some(format!("{ip}:{port}"));
     }
@@ -390,20 +389,26 @@ pub fn resolve_computer_name(id: &str) -> Option<String> {
     }
 }
 
-/// The host-name part of `id` if it looks like a computer name: letters,
-/// digits and '-', not only digits (those are RustDesk IDs), optionally
-/// followed by ".local".
-fn computer_name(id: &str) -> Option<&str> {
-    let name = match id.len().checked_sub(".local".len()) {
-        Some(n) if id.is_char_boundary(n) && id[n..].eq_ignore_ascii_case(".local") => &id[..n],
-        _ => id,
+/// The host-name part of `id` and its port if it looks like a computer name:
+/// letters, digits and '-', not only digits (those are RustDesk IDs),
+/// optionally followed by ".local" and/or ":port".
+fn computer_name(id: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match id.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse::<u16>().ok().filter(|p| *p > 0)?)),
+        None => (id, None),
+    };
+    let name = match host.len().checked_sub(".local".len()) {
+        Some(n) if host.is_char_boundary(n) && host[n..].eq_ignore_ascii_case(".local") => {
+            &host[..n]
+        }
+        _ => host,
     };
     let valid = (1..=63).contains(&name.len())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         && !name.starts_with('-')
         && !name.ends_with('-')
         && !name.chars().all(|c| c.is_ascii_digit());
-    valid.then_some(name)
+    valid.then_some((name, port))
 }
 
 /// The first IPv4 address any of `hosts` resolves to. The lookups run in
@@ -446,16 +451,23 @@ mod tests {
 
     #[test]
     fn test_computer_name() {
-        assert_eq!(computer_name("PC-LAB1"), Some("PC-LAB1"));
-        assert_eq!(computer_name("pc-lab1.local"), Some("pc-lab1"));
-        assert_eq!(computer_name("PC-LAB1.LOCAL"), Some("PC-LAB1"));
+        assert_eq!(computer_name("PC-LAB1"), Some(("PC-LAB1", None)));
+        assert_eq!(computer_name("pc-lab1.local"), Some(("pc-lab1", None)));
+        assert_eq!(computer_name("PC-LAB1.LOCAL"), Some(("PC-LAB1", None)));
+        assert_eq!(computer_name("pc-lab1.local:21118"), Some(("pc-lab1", Some(21118))));
+        assert_eq!(computer_name("pc-lab1:21120"), Some(("pc-lab1", Some(21120))));
         assert_eq!(computer_name("123456789"), None); // numeric ID
+        assert_eq!(computer_name("123456789:21118"), None);
         assert_eq!(computer_name("192.168.1.2"), None);
+        assert_eq!(computer_name("192.168.1.2:21118"), None);
         assert_eq!(computer_name("pc.lan:21118"), None);
+        assert_eq!(computer_name("pc:abc"), None);
+        assert_eq!(computer_name("pc:0"), None);
         assert_eq!(computer_name("pc_lab"), None);
         assert_eq!(computer_name("-pc"), None);
         assert_eq!(computer_name(".local"), None);
         assert_eq!(computer_name(""), None);
         assert_eq!(computer_name("ü.local"), None);
+        assert_eq!(computer_name("fe80::1"), None);
     }
 }
