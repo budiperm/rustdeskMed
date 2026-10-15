@@ -350,3 +350,90 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
     crate::flutter_ffi::main_load_lan_peers();
     Ok(())
 }
+
+const NAME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Turn a computer name typed in the ID box ("PC-LAB1" or "pc-lab1.local")
+/// into a direct-IP address on the LAN ("pc-lab1.local:21118"), so the peer
+/// is reached without knowing its IP. The peer needs "Enable direct IP access".
+/// Returns None for anything that is not such a name, so it is used as an ID.
+pub fn resolve_computer_name(id: &str) -> Option<String> {
+    let name = computer_name(id)?;
+    if config::PeerConfig::exists(id) {
+        return None; // a custom ID connected to before
+    }
+    let port = config::RELAY_PORT + 1;
+    let host = format!("{name}.local");
+    if name_resolves(&host, port as u16) {
+        return Some(format!("{host}:{port}"));
+    }
+    // No mDNS: fall back to the address found by LAN discovery, if unambiguous
+    let mut ips: Vec<String> = config::LanPeers::load()
+        .peers
+        .into_iter()
+        .filter(|p| p.hostname.eq_ignore_ascii_case(name))
+        .flat_map(|p| p.ip_mac.into_keys())
+        .filter(|ip| hbb_common::is_ipv4_str(ip))
+        .collect();
+    ips.sort();
+    ips.dedup();
+    match ips.as_slice() {
+        [ip] => Some(format!("{ip}:{port}")),
+        _ => {
+            log::info!("computer name {name} not found on the LAN, using it as an ID");
+            None
+        }
+    }
+}
+
+/// The host-name part of `id` if it looks like a computer name: letters,
+/// digits and '-', not only digits (those are RustDesk IDs), optionally
+/// followed by ".local".
+fn computer_name(id: &str) -> Option<&str> {
+    let name = match id.len().checked_sub(".local".len()) {
+        Some(n) if id.is_char_boundary(n) && id[n..].eq_ignore_ascii_case(".local") => &id[..n],
+        _ => id,
+    };
+    let valid = (1..=63).contains(&name.len())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.chars().all(|c| c.is_ascii_digit());
+    valid.then_some(name)
+}
+
+fn name_resolves(host: &str, port: u16) -> bool {
+    // The system resolver has no timeout of its own; a missing .local name
+    // can take seconds, so give up early and treat the input as an ID.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = (host.to_owned(), port);
+    std::thread::spawn(move || {
+        let found = target
+            .to_socket_addrs()
+            .map(|mut addrs| addrs.next().is_some())
+            .unwrap_or(false);
+        // The receiver is gone after a timeout; nothing left to report to
+        tx.send(found).ok();
+    });
+    rx.recv_timeout(NAME_LOOKUP_TIMEOUT).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::computer_name;
+
+    #[test]
+    fn test_computer_name() {
+        assert_eq!(computer_name("PC-LAB1"), Some("PC-LAB1"));
+        assert_eq!(computer_name("pc-lab1.local"), Some("pc-lab1"));
+        assert_eq!(computer_name("PC-LAB1.LOCAL"), Some("PC-LAB1"));
+        assert_eq!(computer_name("123456789"), None); // numeric ID
+        assert_eq!(computer_name("192.168.1.2"), None);
+        assert_eq!(computer_name("pc.lan:21118"), None);
+        assert_eq!(computer_name("pc_lab"), None);
+        assert_eq!(computer_name("-pc"), None);
+        assert_eq!(computer_name(".local"), None);
+        assert_eq!(computer_name(""), None);
+        assert_eq!(computer_name("ü.local"), None);
+    }
+}

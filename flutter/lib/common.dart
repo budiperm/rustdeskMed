@@ -2593,9 +2593,10 @@ connect(BuildContext context, String id,
     } catch (_) {}
   }
   id = id.replaceAll(' ', '');
-  final oldId = id;
+  // Strips a trailing "\r" / "/r" (force relay) and turns a LAN computer
+  // name into its direct-IP address, so compare the suffix, not the result.
+  forceRelay = id.endsWith(r'\r') || id.endsWith('/r') || forceRelay;
   id = await bind.mainHandleRelayId(id: id);
-  forceRelay = id != oldId || forceRelay;
   assert(!(isFileTransfer && isTcpTunneling && isRDP),
       "more than one connect type");
 
